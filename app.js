@@ -299,6 +299,59 @@ async function processedHeadImage(path) {
   return promise;
 }
 
+function completeLightingMap(width, height, maskData, sourceLighting) {
+  const pixelCount = width * height;
+  let lighting = new Uint8ClampedArray(sourceLighting);
+  const captured = new Uint8Array(pixelCount);
+  const queued = new Uint8Array(pixelCount);
+  const queue = new Int32Array(pixelCount);
+  let queueStart = 0;
+  let queueEnd = 0;
+
+  for (let pixelIndex = 0; pixelIndex < pixelCount; pixelIndex += 1) {
+    if (maskData[pixelIndex * 4 + 3] <= 8 || lighting[pixelIndex] === 0) continue;
+    captured[pixelIndex] = 1;
+    queued[pixelIndex] = 1;
+    queue[queueEnd++] = pixelIndex;
+  }
+
+  const enqueue = (pixelIndex, light) => {
+    if (pixelIndex < 0 || pixelIndex >= pixelCount || queued[pixelIndex]) return;
+    if (maskData[pixelIndex * 4 + 3] <= 8) return;
+    queued[pixelIndex] = 1;
+    lighting[pixelIndex] = light;
+    queue[queueEnd++] = pixelIndex;
+  };
+
+  while (queueStart < queueEnd) {
+    const pixelIndex = queue[queueStart++];
+    const x = pixelIndex % width;
+    const light = lighting[pixelIndex];
+    if (x > 0) enqueue(pixelIndex - 1, light);
+    if (x < width - 1) enqueue(pixelIndex + 1, light);
+    if (pixelIndex >= width) enqueue(pixelIndex - width, light);
+    if (pixelIndex < pixelCount - width) enqueue(pixelIndex + width, light);
+  }
+
+  for (let pass = 0; pass < 12; pass += 1) {
+    const smoothed = new Uint8ClampedArray(lighting);
+    for (let pixelIndex = 0; pixelIndex < pixelCount; pixelIndex += 1) {
+      if (captured[pixelIndex] || maskData[pixelIndex * 4 + 3] <= 8) continue;
+      const x = pixelIndex % width;
+      let sum = 0;
+      let count = 0;
+      if (x > 0 && lighting[pixelIndex - 1] > 0) { sum += lighting[pixelIndex - 1]; count += 1; }
+      if (x < width - 1 && lighting[pixelIndex + 1] > 0) { sum += lighting[pixelIndex + 1]; count += 1; }
+      if (pixelIndex >= width && lighting[pixelIndex - width] > 0) { sum += lighting[pixelIndex - width]; count += 1; }
+      if (pixelIndex < pixelCount - width && lighting[pixelIndex + width] > 0) { sum += lighting[pixelIndex + width]; count += 1; }
+      if (count > 0) smoothed[pixelIndex] = Math.round(sum / count);
+    }
+    lighting = smoothed;
+  }
+
+  return lighting;
+}
+
 function makeReferenceHeadMask(image) {
   const source = makeCanvas(image.naturalWidth, image.naturalHeight);
   const context = source.getContext("2d", { willReadFrequently: true });
@@ -408,13 +461,14 @@ function makeReferenceHeadMask(image) {
   }
   topSamples.sort((a, b) => a - b);
   const antennaAnchorY = topSamples[Math.floor(topSamples.length / 2)] ?? minY;
+  const completedLightingMap = completeLightingMap(source.width, source.height, data, lightingMap);
 
   return {
     canvas: source,
     bbox: { x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1 },
     faceBounds: detectedFaceBounds,
     antennaAnchor: { x: anchorCenterX, y: antennaAnchorY },
-    lightingMap,
+    lightingMap: completedLightingMap,
     lightingAverage: lightingCount > 0 ? lightingSum / lightingCount : 180
   };
 }
@@ -703,6 +757,25 @@ async function makeHeadTextureCanvas(headProcessed, patternName, color1, color2)
         const distance = Math.hypot((normalizedX - 0.36) * 0.9, (normalizedY - 0.22) * 0.72);
         shade = Math.max(0.72, Math.min(1.12, 1.1 - distance * 0.34));
         highlight = Math.max(0, 0.08 - distance * 0.1);
+      }
+
+      // The source render contains a contact shadow around its original face.
+      // Keep the face area flat, then blend back to the captured 3D lighting
+      // only on the outer part of the head so other outlines do not expose it.
+      if (headProcessed.faceBounds) {
+        const face = headProcessed.faceBounds;
+        const sourceX = bbox.x + x;
+        const sourceY = bbox.y + y;
+        const centerX = face.x + face.width / 2;
+        const centerY = face.y + face.height / 2;
+        const faceDistance = Math.hypot(
+          (sourceX - centerX) / Math.max(1, face.width / 2),
+          (sourceY - centerY) / Math.max(1, face.height / 2)
+        );
+        const blendPosition = Math.max(0, Math.min(1, (faceDistance - 1.12) / 0.3));
+        const outerLightingWeight = blendPosition * blendPosition * (3 - 2 * blendPosition);
+        shade = 1 + (shade - 1) * outerLightingWeight;
+        highlight *= outerLightingWeight;
       }
 
       textureData.data[textureOffset] = Math.min(255, Math.round(sampleChannel(0) * shade + 255 * highlight));
